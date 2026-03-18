@@ -49,6 +49,90 @@ usage_color() {
     fi
 }
 
+# ===== Cross-platform OAuth token resolution =====
+# Tries credential sources in order: env var → macOS Keychain → Linux creds file → GNOME Keyring
+get_oauth_token() {
+    local token=""
+
+    # 1. Explicit env var override
+    if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+        echo "$CLAUDE_CODE_OAUTH_TOKEN"
+        return 0
+    fi
+
+    # 2. macOS Keychain
+    if command -v security >/dev/null 2>&1; then
+        local blob
+        blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+        if [ -n "$blob" ]; then
+            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+            if [ -n "$token" ] && [ "$token" != "null" ]; then
+                echo "$token"
+                return 0
+            fi
+        fi
+    fi
+
+    # 3. Linux credentials file
+    local creds_file="${HOME}/.claude/.credentials.json"
+    if [ -f "$creds_file" ]; then
+        token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+        if [ -n "$token" ] && [ "$token" != "null" ]; then
+            echo "$token"
+            return 0
+        fi
+    fi
+
+    # 4. GNOME Keyring via secret-tool
+    if command -v secret-tool >/dev/null 2>&1; then
+        local blob
+        blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
+        if [ -n "$blob" ]; then
+            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+            if [ -n "$token" ] && [ "$token" != "null" ]; then
+                echo "$token"
+                return 0
+            fi
+        fi
+    fi
+
+    echo ""
+}
+
+# ===== Profile cache (email) =====
+profile_cache_file="/tmp/claude/statusline-profile-cache.json"
+profile_cache_max_age=3600
+mkdir -p /tmp/claude
+
+email=""
+needs_profile_refresh=true
+
+if [ -f "$profile_cache_file" ]; then
+    profile_mtime=$(stat -c %Y "$profile_cache_file" 2>/dev/null || stat -f %m "$profile_cache_file" 2>/dev/null)
+    now=$(date +%s)
+    profile_age=$(( now - profile_mtime ))
+    [ "$profile_age" -lt "$profile_cache_max_age" ] && needs_profile_refresh=false
+    email=$(jq -r '.account.email // empty' "$profile_cache_file" 2>/dev/null)
+fi
+
+if $needs_profile_refresh; then
+    touch "$profile_cache_file" 2>/dev/null
+    _ptoken=$(get_oauth_token)
+    if [ -n "$_ptoken" ] && [ "$_ptoken" != "null" ]; then
+        _presp=$(curl -s --max-time 10 \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $_ptoken" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -H "User-Agent: claude-code/2.1.34" \
+            "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
+        if [ -n "$_presp" ] && echo "$_presp" | jq -e '.account.email' >/dev/null 2>&1; then
+            email=$(echo "$_presp" | jq -r '.account.email')
+            echo "$_presp" > "$profile_cache_file"
+        fi
+    fi
+fi
+
 # ===== Extract data from JSON =====
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 
@@ -103,7 +187,8 @@ if [ -n "$cwd" ]; then
     fi
 fi
 
-out+=" ${dim}|${reset} "
+[ -n "$email" ] && out+=" ${dim}|${reset} ${dim}${email}${reset}"
+out+="\n"
 out+="${orange}${used_tokens}/${total_tokens}${reset} ${dim}(${reset}${green}${pct_used}%${reset}${dim})${reset}"
 out+=" ${dim}|${reset} "
 out+="effort: "
@@ -112,56 +197,7 @@ case "$effort_level" in
     medium) out+="${orange}med${reset}" ;;
     *)      out+="${green}high${reset}" ;;
 esac
-
-# ===== Cross-platform OAuth token resolution (from statusline.sh) =====
-# Tries credential sources in order: env var → macOS Keychain → Linux creds file → GNOME Keyring
-get_oauth_token() {
-    local token=""
-
-    # 1. Explicit env var override
-    if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-        echo "$CLAUDE_CODE_OAUTH_TOKEN"
-        return 0
-    fi
-
-    # 2. macOS Keychain
-    if command -v security >/dev/null 2>&1; then
-        local blob
-        blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-        if [ -n "$blob" ]; then
-            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-            if [ -n "$token" ] && [ "$token" != "null" ]; then
-                echo "$token"
-                return 0
-            fi
-        fi
-    fi
-
-    # 3. Linux credentials file
-    local creds_file="${HOME}/.claude/.credentials.json"
-    if [ -f "$creds_file" ]; then
-        token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-        if [ -n "$token" ] && [ "$token" != "null" ]; then
-            echo "$token"
-            return 0
-        fi
-    fi
-
-    # 4. GNOME Keyring via secret-tool
-    if command -v secret-tool >/dev/null 2>&1; then
-        local blob
-        blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
-        if [ -n "$blob" ]; then
-            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-            if [ -n "$token" ] && [ "$token" != "null" ]; then
-                echo "$token"
-                return 0
-            fi
-        fi
-    fi
-
-    echo ""
-}
+out+="\n"
 
 # ===== LINE 2 & 3: Usage limits with progress bars (cached) =====
 cache_file="/tmp/claude/statusline-usage-cache.json"
@@ -284,7 +320,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e '.five_hour' >/dev/null 2>
     five_hour_reset=$(format_reset_time "$five_hour_reset_iso" "time")
     five_hour_color=$(usage_color "$five_hour_pct")
 
-    out+="${sep}${white}5h${reset} ${five_hour_color}${five_hour_pct}%${reset}"
+    out+="${white}5h${reset} ${five_hour_color}${five_hour_pct}%${reset}"
     [ -n "$five_hour_reset" ] && out+=" ${dim}@${five_hour_reset}${reset}"
 
     # ---- 7-day (weekly) ----
@@ -305,15 +341,57 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e '.five_hour' >/dev/null 2>
         # Validate: if values are empty or contain unexpanded variables, show simple "enabled" label
         if [ -n "$extra_used" ] && [ -n "$extra_limit" ] && [[ "$extra_used" != *'$'* ]] && [[ "$extra_limit" != *'$'* ]]; then
             extra_color=$(usage_color "$extra_pct")
-            out+="${sep}${white}extra${reset} ${extra_color}\$${extra_used}/\$${extra_limit}${reset}"
+            out+="\n${white}extra${reset} ${extra_color}\$${extra_used}/\$${extra_limit}${reset}"
         else
-            out+="${sep}${white}extra${reset} ${green}enabled${reset}"
+            out+="\n${white}extra${reset} ${green}enabled${reset}"
         fi
     fi
 else
     # No valid usage data — show placeholders
-    out+="${sep}${white}5h${reset} ${dim}-${reset}"
+    out+="${white}5h${reset} ${dim}-${reset}"
     out+="${sep}${white}7d${reset} ${dim}-${reset}"
+fi
+
+# ===== Claude service status (status.claude.com) =====
+status_cache_file="/tmp/claude/statusline-status-cache.json"
+status_cache_max_age=60
+claude_status_data=""
+
+if [ -f "$status_cache_file" ]; then
+    status_mtime=$(stat -c %Y "$status_cache_file" 2>/dev/null || stat -f %m "$status_cache_file" 2>/dev/null)
+    now=$(date +%s)
+    status_age=$(( now - status_mtime ))
+    if [ "$status_age" -lt "$status_cache_max_age" ]; then
+        claude_status_data=$(cat "$status_cache_file" 2>/dev/null)
+    fi
+fi
+
+if [ -z "$claude_status_data" ]; then
+    touch "$status_cache_file" 2>/dev/null
+    _sresp=$(curl -s --max-time 10 \
+        -H "Accept: application/json" \
+        "https://status.claude.com/api/v2/summary.json" 2>/dev/null)
+    if [ -n "$_sresp" ] && echo "$_sresp" | jq -e '.status.indicator' >/dev/null 2>&1; then
+        claude_status_data="$_sresp"
+        echo "$_sresp" > "$status_cache_file"
+    fi
+fi
+
+if [ -n "$claude_status_data" ]; then
+    _sindicator=$(echo "$claude_status_data" | jq -r '.status.indicator // "none"')
+    case "$_sindicator" in
+        none)     _scolor="$green"  ; _slabel="ok" ;;
+        minor)    _scolor="$yellow" ; _slabel="degraded" ;;
+        major)    _scolor="$orange" ; _slabel="degraded" ;;
+        critical) _scolor="$red"    ; _slabel="outage" ;;
+        *)        _scolor="$dim"    ; _slabel="unknown" ;;
+    esac
+    out+="\n${white}claude.ai${reset} ${_scolor}${_slabel}${reset}"
+    if [ "$_sindicator" != "none" ]; then
+        _scomps=$(echo "$claude_status_data" | jq -r \
+            '[.components[] | select(.status != "operational") | .name] | join(", ")' 2>/dev/null)
+        [ -n "$_scomps" ] && out+=" ${dim}(${reset}${_scomps}${dim})${reset}"
+    fi
 fi
 
 # Output single line

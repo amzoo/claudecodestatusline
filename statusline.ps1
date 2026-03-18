@@ -39,6 +39,72 @@ function Get-UsageColor([int]$pct) {
     else { return $green }
 }
 
+# ===== OAuth token resolution =====
+function Get-OAuthToken {
+    # 1. Explicit env var override
+    if ($env:CLAUDE_CODE_OAUTH_TOKEN) {
+        return $env:CLAUDE_CODE_OAUTH_TOKEN
+    }
+
+    # 2. Windows Credential Manager (via cmdkey/CredentialManager)
+    try {
+        if (Get-Command "cmdkey.exe" -ErrorAction SilentlyContinue) {
+            # Try reading from Windows Credential Manager using PowerShell
+            $credPath = Join-Path $env:LOCALAPPDATA "Claude Code\credentials.json"
+            if (Test-Path $credPath) {
+                $creds = Get-Content $credPath -Raw | ConvertFrom-Json
+                $token = $creds.claudeAiOauth.accessToken
+                if ($token -and $token -ne "null") { return $token }
+            }
+        }
+    } catch {}
+
+    # 3. Credentials file (cross-platform fallback)
+    $credsFile = Join-Path $env:USERPROFILE ".claude\.credentials.json"
+    if (Test-Path $credsFile) {
+        try {
+            $creds = Get-Content $credsFile -Raw | ConvertFrom-Json
+            $token = $creds.claudeAiOauth.accessToken
+            if ($token -and $token -ne "null") { return $token }
+        } catch {}
+    }
+
+    return $null
+}
+
+# ===== Profile cache (email) =====
+$profileCacheFile = Join-Path $env:TEMP "claude\statusline-profile-cache.json"
+$profileCacheMaxAge = 3600
+$email = ""
+$needsProfileRefresh = $true
+
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP "claude") -ErrorAction SilentlyContinue
+
+if (Test-Path $profileCacheFile) {
+    $profileAge = ((Get-Date) - (Get-Item $profileCacheFile).LastWriteTime).TotalSeconds
+    if ($profileAge -lt $profileCacheMaxAge) { $needsProfileRefresh = $false }
+    try { $email = (Get-Content $profileCacheFile -Raw | ConvertFrom-Json).account.email } catch {}
+}
+
+if ($needsProfileRefresh) {
+    $pToken = Get-OAuthToken
+    if ($pToken) {
+        try {
+            $pHeaders = @{
+                "Accept"         = "application/json"
+                "Content-Type"   = "application/json"
+                "Authorization"  = "Bearer $pToken"
+                "anthropic-beta" = "oauth-2025-04-20"
+                "User-Agent"     = "claude-code/2.1.34"
+            }
+            $pResp = Invoke-RestMethod -Uri "https://api.anthropic.com/api/oauth/profile" `
+                -Headers $pHeaders -Method Get -TimeoutSec 10 -ErrorAction Stop
+            $email = $pResp.account.email
+            $pResp | ConvertTo-Json -Depth 10 | Set-Content $profileCacheFile -Force
+        } catch {}
+    }
+}
+
 # ===== Extract data from JSON =====
 $data = $input | ConvertFrom-Json
 
@@ -114,7 +180,8 @@ if ($cwd) {
     }
 }
 
-$out += " ${dim}|${reset} "
+if ($email) { $out += " ${dim}|${reset} ${dim}${email}${reset}" }
+$out += "\n"
 $out += "${orange}${usedTokens}/${totalTokens}${reset} ${dim}(${reset}${green}${pctUsed}%${reset}${dim})${reset}"
 $out += " ${dim}|${reset} "
 $out += "effort: "
@@ -123,39 +190,7 @@ switch ($effortLevel) {
     "medium" { $out += "${orange}med${reset}" }
     default  { $out += "${green}high${reset}" }
 }
-
-# ===== OAuth token resolution =====
-function Get-OAuthToken {
-    # 1. Explicit env var override
-    if ($env:CLAUDE_CODE_OAUTH_TOKEN) {
-        return $env:CLAUDE_CODE_OAUTH_TOKEN
-    }
-
-    # 2. Windows Credential Manager (via cmdkey/CredentialManager)
-    try {
-        if (Get-Command "cmdkey.exe" -ErrorAction SilentlyContinue) {
-            # Try reading from Windows Credential Manager using PowerShell
-            $credPath = Join-Path $env:LOCALAPPDATA "Claude Code\credentials.json"
-            if (Test-Path $credPath) {
-                $creds = Get-Content $credPath -Raw | ConvertFrom-Json
-                $token = $creds.claudeAiOauth.accessToken
-                if ($token -and $token -ne "null") { return $token }
-            }
-        }
-    } catch {}
-
-    # 3. Credentials file (cross-platform fallback)
-    $credsFile = Join-Path $env:USERPROFILE ".claude\.credentials.json"
-    if (Test-Path $credsFile) {
-        try {
-            $creds = Get-Content $credsFile -Raw | ConvertFrom-Json
-            $token = $creds.claudeAiOauth.accessToken
-            if ($token -and $token -ne "null") { return $token }
-        } catch {}
-    }
-
-    return $null
-}
+$out += "\n"
 
 # ===== Usage limits with caching =====
 $cacheDir = Join-Path $env:TEMP "claude"
@@ -226,7 +261,7 @@ if ($usageData) {
         $fiveHourReset = Format-ResetTime $fiveHourResetIso "time"
         $fiveHourColor = Get-UsageColor $fiveHourPct
 
-        $out += "${sep}${white}5h${reset} ${fiveHourColor}${fiveHourPct}%${reset}"
+        $out += "${white}5h${reset} ${fiveHourColor}${fiveHourPct}%${reset}"
         if ($fiveHourReset) { $out += " ${dim}@${fiveHourReset}${reset}" }
 
         # ---- 7-day (weekly) ----
@@ -249,12 +284,50 @@ if ($usageData) {
                 $extraUsed = "{0:F2}" -f ([double]$extraUsedRaw / 100)
                 $extraLimit = "{0:F2}" -f ([double]$extraLimitRaw / 100)
                 $extraColor = Get-UsageColor $extraPct
-                $out += "${sep}${white}extra${reset} ${extraColor}`$${extraUsed}/`$${extraLimit}${reset}"
+                $out += "\n${white}extra${reset} ${extraColor}`$${extraUsed}/`$${extraLimit}${reset}"
             } else {
-                $out += "${sep}${white}extra${reset} ${green}enabled${reset}"
+                $out += "\n${white}extra${reset} ${green}enabled${reset}"
             }
         }
     } catch {}
+}
+
+# ===== Claude service status (status.claude.com) =====
+$statusCacheFile = Join-Path $env:TEMP "claude\statusline-status-cache.json"
+$statusCacheMaxAge = 60
+$claudeStatusData = $null
+
+if (Test-Path $statusCacheFile) {
+    $statusAge = ((Get-Date) - (Get-Item $statusCacheFile).LastWriteTime).TotalSeconds
+    if ($statusAge -lt $statusCacheMaxAge) {
+        try { $claudeStatusData = Get-Content $statusCacheFile -Raw | ConvertFrom-Json } catch {}
+    }
+}
+
+if (-not $claudeStatusData) {
+    try {
+        $claudeStatusData = Invoke-RestMethod -Uri "https://status.claude.com/api/v2/summary.json" `
+            -Method Get -TimeoutSec 10 -ErrorAction Stop
+        $claudeStatusData | ConvertTo-Json -Depth 10 | Set-Content $statusCacheFile -Force
+    } catch {}
+}
+
+if ($claudeStatusData) {
+    $sIndicator = $claudeStatusData.status.indicator
+    switch ($sIndicator) {
+        "none"     { $sColor = $green;  $sLabel = "ok" }
+        "minor"    { $sColor = $yellow; $sLabel = "degraded" }
+        "major"    { $sColor = $orange; $sLabel = "degraded" }
+        "critical" { $sColor = $red;    $sLabel = "outage" }
+        default    { $sColor = $dim;    $sLabel = "unknown" }
+    }
+    $out += "\n${white}claude.ai${reset} ${sColor}${sLabel}${reset}"
+    if ($sIndicator -ne "none") {
+        $sComps = ($claudeStatusData.components |
+            Where-Object { $_.status -ne "operational" } |
+            Select-Object -ExpandProperty name) -join ", "
+        if ($sComps) { $out += " ${dim}(${reset}${sComps}${dim})${reset}" }
+    }
 }
 
 # Output single line
